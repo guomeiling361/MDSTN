@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import numpy as np
 import torch
@@ -12,14 +13,15 @@ from sklearn import metrics
 from datetime import datetime
 
 # 导入自定义模块
-from dataset import read_data
+from dataset import read_data, read_test_data
 from MDSTN import MCDAG
-
 
 # 基础配置
 torch.manual_seed(22)
-np.random.seed(22)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+plt.rcParams["font.family"] = ["SimHei", "WenQuanYi Micro Hei"]  # 支持中文绘图
+
+
 # 模型参数量统计
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
@@ -29,20 +31,16 @@ def count_parameters(model):
 
 # 预测平滑
 def moving_average_smooth(pred, window_size=3):
-    pred = pred.copy()
     pad = window_size // 2
     pred_padded = np.pad(pred, ((pad, pad), (0, 0), (0, 0), (0, 0)), mode='edge')
-
     for i in range(pad, len(pred_padded) - pad):
         pred[i - pad] = np.mean(pred_padded[i - pad:i + pad + 1], axis=0)
-
     return pred
 
 
 # 命令行参数
 def get_args():
     parser = argparse.ArgumentParser()
-
     parser.add_argument('-height', type=int, default=100)
     parser.add_argument('-width', type=int, default=100)
     parser.add_argument('-traffic', type=str, default='sms')
@@ -58,13 +56,15 @@ def get_args():
     parser.add_argument('-train', action='store_true', default=True)
     parser.add_argument('-test_size', type=int, default=24 * 7)
     parser.add_argument('-save_dir', type=str, default='results')
+
+    # 功能开关
+    parser.add_argument('-use_meta', action='store_true', default=False)
     parser.add_argument('-use_cross', action='store_true', default=True)
     parser.add_argument('-use_causal_conv', action='store_true', default=True)
     parser.add_argument('-temporal_use_transformer', action='store_true', default=False)
     parser.add_argument('-use_dense_conv', action='store_true', default=True)
     parser.add_argument('-spatial_use_transformer', action='store_true', default=False)
     parser.add_argument('-fusion_mode', type=int, default=0)
-
     return parser.parse_args()
 
 
@@ -81,17 +81,21 @@ def run_epoch(model, loader, criterion, optimizer=None):
 
     with torch.set_grad_enabled(optimizer is not None):
         for batch in loader:
-            if len(batch) == 3:
-                x, cross, target = batch
+            if len(batch) == 4:
+                x, meta, cross, target = batch
+            elif len(batch) == 3:
+                x, meta, target = batch
+                cross = None
             else:
                 x, target = batch
-                cross = None
+                meta, cross = None, None
 
             x = x.float().to(device)
             target = target.float().to(device)
+            meta = meta.float().to(device) if meta is not None else None
             cross = cross.float().to(device) if cross is not None else None
 
-            pred, _ = model(x, cross)
+            pred, _ = model(x, cross, meta)
             loss = criterion(pred, target)
             total_loss += loss.item()
 
@@ -101,25 +105,22 @@ def run_epoch(model, loader, criterion, optimizer=None):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
 
-    return total_loss / max(len(loader), 1)
+    return total_loss / len(loader)
 
 
 # 训练主函数
-def train_model(model, train_loader, valid_loader, criterion, opt, mmn):
+def train_model(model, train_loader, valid_loader, criterion, opt):
     best_loss = float('inf')
     train_loss, valid_loss = [], []
     early_stop = 0
     patience = 30
 
     optimizer = optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=[int(0.5 * opt.epoch_size), int(0.75 * opt.epoch_size)],
-        gamma=0.1
-    )
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
+                                               milestones=[int(0.5 * opt.epoch_size), int(0.75 * opt.epoch_size)],
+                                               gamma=0.1)
 
     total_start = time.time()
-
     for epoch in range(opt.epoch_size):
         t_loss = run_epoch(model, train_loader, criterion, optimizer)
         v_loss = run_epoch(model, valid_loader, criterion)
@@ -132,31 +133,24 @@ def train_model(model, train_loader, valid_loader, criterion, opt, mmn):
         if v_loss < best_loss:
             best_loss = v_loss
             early_stop = 0
-
             torch.save(model.state_dict(), f'{opt.model_filename}.pth')
             with open(f'{opt.model_filename}_mmn.pkl', 'wb') as f:
                 pickle.dump(mmn, f)
         else:
             early_stop += 1
             if early_stop >= patience:
-                print(f"早停：{patience} 轮无提升")
+                print(f"早停：{patience}轮无提升")
                 break
 
         # 日志
         if epoch % 10 == 0:
             print(
-                f'Epoch {epoch + 1}/{opt.epoch_size} | '
-                f'Train: {t_loss:.6f} | Valid: {v_loss:.6f} | Best: {best_loss:.6f}'
-            )
+                f'Epoch {epoch + 1}/{opt.epoch_size} | Train: {t_loss:.6f} | Valid: {v_loss:.6f} | Best: {best_loss:.6f}')
+        log(f'{opt.model_filename}.log', f'Epoch {epoch + 1} | Train: {t_loss:.6f} | Valid: {v_loss:.6f}')
 
-        log(
-            f'{opt.model_filename}.log',
-            f'Epoch {epoch + 1} | Train: {t_loss:.6f} | Valid: {v_loss:.6f}'
-        )
-
+    # 训练时间统计
     total_time = time.time() - total_start
     print(f'总训练时间：{total_time // 3600:.0f}h {total_time % 3600 // 60:.0f}m')
-
     return train_loss, valid_loss
 
 
@@ -167,37 +161,34 @@ def predict(model, test_loader, mmn, opt):
 
     with torch.no_grad():
         for batch in test_loader:
-            if len(batch) == 3:
-                x, cross, target = batch
+            if len(batch) == 4:
+                x, meta, cross, target = batch
+            elif len(batch) == 3:
+                x, meta, target = batch
+                cross = None
             else:
                 x, target = batch
-                cross = None
+                meta, cross = None, None
 
             x = x.float().to(device)
+            meta = meta.float().to(device) if meta is not None else None
             cross = cross.float().to(device) if cross is not None else None
 
-            pred, gate = model(x, cross)
+            pred, gate = model(x, cross, meta)
             preds.append(pred.cpu().numpy())
             truths.append(target.cpu().numpy())
-
             if gate is not None:
-                h = opt.rows[1] - opt.rows[0] if opt.crop else opt.height
-                w = opt.cols[1] - opt.cols[0] if opt.crop else opt.width
+                gates.append(gate.transpose(1, 2).view(x.shape[0], -1, opt.rows[1] - opt.rows[0],
+                                                       opt.cols[1] - opt.cols[0]).cpu().numpy())
 
-                gates.append(
-                    gate.transpose(1, 2)
-                    .view(x.shape[0], -1, h, w)
-                    .cpu()
-                    .numpy()
-                )
-
+    # 拼接数据
     pred_norm = moving_average_smooth(np.concatenate(preds))
     truth_norm = np.concatenate(truths)
     gate_np = np.concatenate(gates) if gates else None
 
+    # 反归一化 + 合理后处理（流量非负）
     pred = mmn.inverse_transform(pred_norm).clip(min=0)
     truth = mmn.inverse_transform(truth_norm)
-
     return pred, truth, gate_np
 
 
@@ -205,52 +196,41 @@ def predict(model, test_loader, mmn, opt):
 def train_valid_split(dataset, test_size=0.1):
     idx = np.random.permutation(len(dataset))
     split = int(len(idx) * test_size)
-    split = max(split, 1)
-
     return idx[split:], idx[:split]
 
 
 if __name__ == '__main__':
     opt = get_args()
-
-    
+    # ===================== 请修改这里的路径 =====================
     DATA_PATH = "/root/autodl-fs/data_git_version.h5"
     FEATURE_PATH = "/root/autodl-fs/11.MVSTGN-main/MVSTGN-main/data/crawled_feature.csv"
-    
+    # ===========================================================
 
     # 实验路径配置
-    exp_flag = (
-        f"no_meta_"
-        f"cross_{opt.use_cross}_"
-        f"causal_{opt.use_causal_conv}_"
-        f"temp_{'trans' if opt.temporal_use_transformer else 'mamba'}_"
-        f"dense_{opt.use_dense_conv}_"
-        f"spat_{'trans' if opt.spatial_use_transformer else 'mamba'}_"
-        f"fusion_{opt.fusion_mode}"
-    )
-
+    exp_flag = f"causal_{opt.use_causal_conv}_temp_{'trans' if opt.temporal_use_transformer else 'mamba'}_dense_{opt.use_dense_conv}_spat_{'trans' if opt.spatial_use_transformer else 'mamba'}_fusion_{opt.fusion_mode}"
     opt.save_dir = f"{opt.save_dir}/{opt.traffic}/MCDAG/{exp_flag}"
     os.makedirs(opt.save_dir, exist_ok=True)
     opt.model_filename = f"{opt.save_dir}/MCDAG_{opt.traffic}"
 
-   
-    X, X_cross, y, mmn = read_data(DATA_PATH, FEATURE_PATH, opt)
+    # 加载数据
+    X, X_meta, X_cross, y, mmn = read_data(DATA_PATH, FEATURE_PATH, opt)
+    if not opt.use_meta: X_meta = None
+    if not opt.use_cross: X_cross = None
 
-    if not opt.use_cross:
-        X_cross = None
-
-    # 数据集分割：最后 opt.test_size 个样本作为测试集
+    # 数据集分割
     x_train, x_test = X[:-opt.test_size], X[-opt.test_size:]
     y_train, y_test = y[:-opt.test_size], y[-opt.test_size:]
-
-    cross_train, cross_test = (
-        (X_cross[:-opt.test_size], X_cross[-opt.test_size:])
-        if opt.use_cross else
-        (None, None)
-    )
+    meta_train, meta_test = (X_meta[:-opt.test_size], X_meta[-opt.test_size:]) if opt.use_meta else (None, None)
+    cross_train, cross_test = (X_cross[:-opt.test_size], X_cross[-opt.test_size:]) if opt.use_cross else (None, None)
 
     # 构建数据集
-    if opt.use_cross:
+    if opt.use_meta and opt.use_cross:
+        train_dataset = list(zip(x_train, meta_train, cross_train, y_train))
+        test_dataset = list(zip(x_test, meta_test, cross_test, y_test))
+    elif opt.use_meta:
+        train_dataset = list(zip(x_train, meta_train, y_train))
+        test_dataset = list(zip(x_test, meta_test, y_test))
+    elif opt.use_cross:
         train_dataset = list(zip(x_train, cross_train, y_train))
         test_dataset = list(zip(x_test, cross_test, y_test))
     else:
@@ -259,38 +239,17 @@ if __name__ == '__main__':
 
     # 数据加载器
     train_idx, valid_idx = train_valid_split(train_dataset)
+    train_loader = DataLoader(train_dataset, opt.batch_size, sampler=SubsetRandomSampler(train_idx), num_workers=0,
+                              drop_last=True)
+    valid_loader = DataLoader(train_dataset, opt.batch_size, sampler=SubsetRandomSampler(valid_idx), num_workers=0)
+    test_loader = DataLoader(test_dataset, opt.batch_size, shuffle=False, num_workers=0)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=opt.batch_size,
-        sampler=SubsetRandomSampler(train_idx),
-        num_workers=0,
-        drop_last=True
-    )
-
-    valid_loader = DataLoader(
-        train_dataset,
-        batch_size=opt.batch_size,
-        sampler=SubsetRandomSampler(valid_idx),
-        num_workers=0
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=opt.batch_size,
-        shuffle=False,
-        num_workers=0
-    )
-
-  
+    # 初始化模型
     model = MCDAG(
-        input_shape=X.shape,
-        cross_shape=X_cross.shape if opt.use_cross else None,
-        nb_flows=opt.nb_flow,
-        use_causal_conv=opt.use_causal_conv,
-        temporal_use_transformer=opt.temporal_use_transformer,
-        use_dense_conv=opt.use_dense_conv,
-        spatial_use_transformer=opt.spatial_use_transformer,
+        input_shape=X.shape, meta_shape=X_meta.shape if opt.use_meta else None,
+        cross_shape=X_cross.shape if opt.use_cross else None, nb_flows=opt.nb_flow,
+        use_causal_conv=opt.use_causal_conv, temporal_use_transformer=opt.temporal_use_transformer,
+        use_dense_conv=opt.use_dense_conv, spatial_use_transformer=opt.spatial_use_transformer,
         fusion_mode=opt.fusion_mode
     ).to(device)
 
@@ -304,14 +263,7 @@ if __name__ == '__main__':
     # 训练
     if opt.train:
         print("开始训练...")
-        train_loss, valid_loss = train_model(
-            model,
-            train_loader,
-            valid_loader,
-            criterion,
-            opt,
-            mmn
-        )
+        train_loss, valid_loss = train_model(model, train_loader, valid_loader, criterion, opt)
 
         # 保存损失曲线
         plt.figure(figsize=(10, 6))
@@ -319,8 +271,6 @@ if __name__ == '__main__':
         plt.plot(valid_loss, label='验证损失')
         plt.legend()
         plt.savefig(f"{opt.save_dir}/loss_curve.png")
-        plt.close()
-
         np.savez(f"{opt.save_dir}/loss_data.npz", train=train_loss, valid=valid_loss)
 
     # 测试
@@ -336,24 +286,9 @@ if __name__ == '__main__':
     print(f'测试结果：RMSE={rmse:.4f} | MAE={mae:.4f} | R²={r2:.4f}')
 
     # 保存结果
-    save_dict = {
-        'pred': pred,
-        'truth': truth,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2,
-        'params': total_params
-    }
-
-    if gate_z is not None:
-        save_dict['gate_z'] = gate_z
-
+    save_dict = {'pred': pred, 'truth': truth, 'rmse': rmse, 'mae': mae, 'r2': r2, 'params': total_params}
+    if gate_z is not None: save_dict['gate_z'] = gate_z
     np.savez(f"{opt.save_dir}/predictions.npz", **save_dict)
 
     with open(f"{opt.save_dir}/metrics.txt", 'w', encoding='utf-8') as f:
-        f.write(
-            f"RMSE: {rmse:.4f}\n"
-            f"MAE: {mae:.4f}\n"
-            f"R2: {r2:.4f}\n"
-            f"总参数量: {total_params:,}"
-        )
+        f.write(f"RMSE: {rmse:.4f}\nMAE: {mae:.4f}\nR2: {r2:.4f}\n总参数量: {total_params:,}")

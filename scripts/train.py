@@ -82,7 +82,7 @@ def run_epoch(model, loader, criterion, optimizer=None):
     with torch.set_grad_enabled(optimizer is not None):
         for batch in loader:
             if len(batch) == 4:
-                x, meta, cross, target = batch
+                x, cross, meta, target = batch
             elif len(batch) == 3:
                 x, meta, target = batch
                 cross = None
@@ -162,7 +162,7 @@ def predict(model, test_loader, mmn, opt):
     with torch.no_grad():
         for batch in test_loader:
             if len(batch) == 4:
-                x, meta, cross, target = batch
+                x, cross, meta, target = batch
             elif len(batch) == 3:
                 x, meta, target = batch
                 cross = None
@@ -223,19 +223,26 @@ if __name__ == '__main__':
     meta_train, meta_test = (X_meta[:-opt.test_size], X_meta[-opt.test_size:]) if opt.use_meta else (None, None)
     cross_train, cross_test = (X_cross[:-opt.test_size], X_cross[-opt.test_size:]) if opt.use_cross else (None, None)
 
-    # 构建数据集
     if opt.use_meta and opt.use_cross:
-        train_dataset = list(zip(x_train, meta_train, cross_train, y_train))
-        test_dataset = list(zip(x_test, meta_test, cross_test, y_test))
+        # 正确顺序：x, cross, meta, y
+        train_dataset = list(zip(x_train, cross_train, meta_train, y_train))
+        test_dataset = list(zip(x_test, cross_test, meta_test, y_test))
+
     elif opt.use_meta:
+        # 没 cross 但有 meta
         train_dataset = list(zip(x_train, meta_train, y_train))
         test_dataset = list(zip(x_test, meta_test, y_test))
+
     elif opt.use_cross:
+         # 只有 cross
         train_dataset = list(zip(x_train, cross_train, y_train))
         test_dataset = list(zip(x_test, cross_test, y_test))
+
     else:
         train_dataset = list(zip(x_train, y_train))
         test_dataset = list(zip(x_test, y_test))
+
+        # =====================================================================
 
     # 数据加载器
     train_idx, valid_idx = train_valid_split(train_dataset)

@@ -75,60 +75,75 @@ def traffic_loader(f, feature_path, opt):
     return result, feature
 
 
-# 读取训练/验证数据
+def _build_supervised_samples(data_scaled, index, opt):
+    close_size = opt.close_size
+    horizon = getattr(opt, "horizon", 1)
+
+    X, y, target_times = [], [], []
+
+
+    for end in range(close_size, len(data_scaled) - horizon + 1):
+        target_idx = end + horizon - 1
+
+
+        xseq = data_scaled[end - close_size:end]
+
+        X.append(xseq)
+        y.append(data_scaled[target_idx])
+        target_times.append(index[target_idx])
+
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    X_meta = get_time_features(target_times)
+
+    return X, X_meta, y
+
+
 def read_data(path, feature_path, opt):
     f = h5py.File(path, 'r')
     data, feature_data = traffic_loader(f, feature_path, opt)
     index = to_datetime(f['idx'][()].astype(str), format='%Y-%m-%d %H:%M')
 
-    # 归一化
+    horizon = getattr(opt, "horizon", 1)
+
+    # 测试集目标对应最后 opt.test_size 个时间点
+    train_boundary = len(data) - opt.test_size
+
+    if train_boundary <= opt.close_size + horizon:
+        f.close()
+        raise ValueError(
+            f"数据长度不足：len(data)={len(data)}, "
+            f"train_boundary={train_boundary}, "
+            f"close_size={opt.close_size}, horizon={horizon}"
+        )
+
+
     mmn = MinMaxNorm01()
-    data_scaled = mmn.fit_transform(data)
+    mmn.fit(data[:train_boundary])
+    data_scaled = mmn.transform(data)
 
-    # 时间元数据
-    valid_index = index[opt.close_size:]
-    X_meta = get_time_features(valid_index)
 
-    # 构建时序窗口
-    X, y = [], []
-    for i in range(opt.close_size, len(data)):
-        xseq = [data_scaled[i - c] for c in range(1, opt.close_size + 1)]
-        X.append(xseq)
-        y.append(data_scaled[i])
+    X, X_meta, y = _build_supervised_samples(data_scaled, index, opt)
 
-    X, y = np.asarray(X), np.asarray(y)
-
-    # 静态跨域特征
-    feat = np.moveaxis(feature_data, -1, 0)
+    # 静态跨域特征: (C, H, W)
+    feat = np.moveaxis(feature_data, -1, 0).astype(np.float32)
     X_crossdata = np.repeat(feat[np.newaxis, ...], X.shape[0], axis=0)
 
     f.close()
     return X, X_meta, X_crossdata, y, mmn
 
 
-# 读取测试数据
 def read_test_data(path, feature_path, opt, mmn):
     f = h5py.File(path, 'r')
     data, feature_data = traffic_loader(f, feature_path, opt)
     index = to_datetime(f['idx'][()].astype(str), format='%Y-%m-%d %H:%M')
+
     data_scaled = mmn.transform(data)
 
-    # 构建时序窗口
-    X_test, y_test = [], []
-    for i in range(opt.close_size, len(data)):
-        xseq = [data_scaled[i - c] for c in range(1, opt.close_size + 1)]
-        X_test.append(xseq)
-        y_test.append(data_scaled[i])
+    X_test, X_meta_test, y_test = _build_supervised_samples(data_scaled, index, opt)
 
-    X_test, y_test = np.asarray(X_test), np.asarray(y_test)
-
-    # 静态跨域特征
-    feat = np.moveaxis(feature_data, -1, 0)
+    feat = np.moveaxis(feature_data, -1, 0).astype(np.float32)
     X_cross = np.repeat(feat[np.newaxis, ...], X_test.shape[0], axis=0)
-
-    # 时间元数据
-    valid_index = index[opt.close_size:]
-    X_meta_test = get_time_features(valid_index)
 
     f.close()
     return X_test, X_meta_test, X_cross, y_test

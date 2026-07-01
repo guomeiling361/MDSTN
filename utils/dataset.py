@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 import pandas as pd
 from pandas import to_datetime
 import h5py
@@ -40,6 +39,7 @@ def get_time_features(index_list):
         is_milan_holiday = 1.0 if (holiday_start <= idx <= holiday_end) else 0.0
         weekday_norm = weekday / 6.0
         features.append([weekday_norm, is_weekend, is_weekday, is_milan_holiday])
+
     return np.array(features, dtype=np.float32)
 
 
@@ -52,7 +52,12 @@ def traffic_loader(f, feature_path, opt):
     # 特征工程
     feature_mean = feature_data.mean(axis=1).values.reshape(-1, 1)
     feature_std = feature_data.std(axis=1).values.reshape(-1, 1)
-    feature_eng = np.concatenate([feature_data.values, feature_mean, feature_std], axis=1)
+    feature_eng = np.concatenate([feature_data.values, feature_mean, feature_std], axis=1).astype(np.float32)
+
+    feat_min = feature_eng.min(axis=0, keepdims=True)
+    feat_max = feature_eng.max(axis=0, keepdims=True)
+    feature_eng = (feature_eng - feat_min) / (feat_max - feat_min + 1e-8)
+
     feature = np.reshape(feature_eng, (opt.height, opt.width, feature_eng.shape[1]))
 
     # 加载流量数据（仅支持单流量）
@@ -63,8 +68,9 @@ def traffic_loader(f, feature_path, opt):
     elif opt.traffic == 'internet':
         data = f['data'][:, :, 2]
     else:
-        raise ValueError("未知流量类型")
+        raise ValueError(f"未知流量类型: {opt.traffic}")
 
+    data = np.asarray(data, dtype=np.float32)
     result = data.reshape((-1, 1, opt.height, opt.width))
 
     # 空间裁剪
@@ -72,19 +78,18 @@ def traffic_loader(f, feature_path, opt):
         result = result[:, :, opt.rows[0]:opt.rows[1], opt.cols[0]:opt.cols[1]]
         feature = feature[opt.rows[0]:opt.rows[1], opt.cols[0]:opt.cols[1], :]
 
-    return result, feature
+    return result, feature.astype(np.float32)
 
 
 def _build_supervised_samples(data_scaled, index, opt):
+
     close_size = opt.close_size
     horizon = getattr(opt, "horizon", 1)
 
     X, y, target_times = [], [], []
 
-
     for end in range(close_size, len(data_scaled) - horizon + 1):
         target_idx = end + horizon - 1
-
 
         xseq = data_scaled[end - close_size:end]
 
@@ -99,51 +104,52 @@ def _build_supervised_samples(data_scaled, index, opt):
     return X, X_meta, y
 
 
+# 读取训练/验证/测试数据
 def read_data(path, feature_path, opt):
-    f = h5py.File(path, 'r')
-    data, feature_data = traffic_loader(f, feature_path, opt)
-    index = to_datetime(f['idx'][()].astype(str), format='%Y-%m-%d %H:%M')
+    with h5py.File(path, 'r') as f:
+        data, feature_data = traffic_loader(f, feature_path, opt)
+        index = to_datetime(f['idx'][()].astype(str), format='%Y-%m-%d %H:%M')
 
     horizon = getattr(opt, "horizon", 1)
 
     # 测试集目标对应最后 opt.test_size 个时间点
     train_boundary = len(data) - opt.test_size
 
-    if train_boundary <= opt.close_size + horizon:
-        f.close()
+    if train_boundary < opt.close_size + horizon:
         raise ValueError(
             f"数据长度不足：len(data)={len(data)}, "
             f"train_boundary={train_boundary}, "
             f"close_size={opt.close_size}, horizon={horizon}"
         )
 
-
     mmn = MinMaxNorm01()
     mmn.fit(data[:train_boundary])
     data_scaled = mmn.transform(data)
-
 
     X, X_meta, y = _build_supervised_samples(data_scaled, index, opt)
 
     # 静态跨域特征: (C, H, W)
     feat = np.moveaxis(feature_data, -1, 0).astype(np.float32)
-    X_crossdata = np.repeat(feat[np.newaxis, ...], X.shape[0], axis=0)
+    X_crossdata = np.repeat(feat[np.newaxis, ...], X.shape[0], axis=0).astype(np.float32)
 
-    f.close()
     return X, X_meta, X_crossdata, y, mmn
 
 
 def read_test_data(path, feature_path, opt, mmn):
-    f = h5py.File(path, 'r')
-    data, feature_data = traffic_loader(f, feature_path, opt)
-    index = to_datetime(f['idx'][()].astype(str), format='%Y-%m-%d %H:%M')
+    with h5py.File(path, 'r') as f:
+        data, feature_data = traffic_loader(f, feature_path, opt)
+        index = to_datetime(f['idx'][()].astype(str), format='%Y-%m-%d %H:%M')
 
     data_scaled = mmn.transform(data)
 
-    X_test, X_meta_test, y_test = _build_supervised_samples(data_scaled, index, opt)
+    X_all, X_meta_all, y_all = _build_supervised_samples(data_scaled, index, opt)
+
+    X_test = X_all[-opt.test_size:]
+    X_meta_test = X_meta_all[-opt.test_size:]
+    y_test = y_all[-opt.test_size:]
 
     feat = np.moveaxis(feature_data, -1, 0).astype(np.float32)
-    X_cross = np.repeat(feat[np.newaxis, ...], X_test.shape[0], axis=0)
+    X_cross_all = np.repeat(feat[np.newaxis, ...], X_all.shape[0], axis=0).astype(np.float32)
+    X_cross = X_cross_all[-opt.test_size:]
 
-    f.close()
     return X_test, X_meta_test, X_cross, y_test

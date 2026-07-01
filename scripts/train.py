@@ -84,9 +84,6 @@ def get_args():
     parser.add_argument('-traffic', type=str, default='sms',
                         choices=['sms', 'call', 'internet'])
     parser.add_argument('-nb_flow', type=int, default=1)
-
-    # 如果数据是小时粒度：close_size=24, horizon=1
-    # 如果数据是10分钟粒度：close_size=144, horizon=6
     parser.add_argument('-close_size', type=int, default=24)
     parser.add_argument('-horizon', type=int, default=1)
 
@@ -114,7 +111,6 @@ def get_args():
 
     parser.add_argument('-fusion_mode', type=int, default=0)
 
-    # 默认不平滑；如果需要平滑可设为 3
     parser.add_argument('-smooth_window', type=int, default=1)
 
     return parser.parse_args()
@@ -126,13 +122,7 @@ def log(fname, s):
 
 
 def unpack_batch(batch, opt):
-    """
-    根据 opt.use_cross / opt.use_meta 解包 batch。
-    不能只根据 len(batch)==3 判断，因为:
-        (x, cross, y)
-        (x, meta, y)
-    都是长度3。
-    """
+
     if opt.use_cross and opt.use_meta:
         x, cross, meta, target = batch
     elif opt.use_cross:

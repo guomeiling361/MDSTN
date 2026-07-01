@@ -75,7 +75,7 @@ def log(fname, s):
 
 
 # 单轮训练/验证
-def run_epoch(model, loader, criterion, optimizer=None):
+def run_epoch(model, loader, criterion, opt, optimizer=None):
     total_loss = 0.0
     model.train() if optimizer else model.eval()
 

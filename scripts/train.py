@@ -109,27 +109,29 @@ def run_epoch(model, loader, criterion, optimizer=None):
 
 
 # 训练主函数
-def train_model(model, train_loader, valid_loader, criterion, opt):
+def train_model(model, train_loader, valid_loader, criterion, opt, mmn):
     best_loss = float('inf')
     train_loss, valid_loss = [], []
     early_stop = 0
     patience = 30
 
     optimizer = optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
-                                               milestones=[int(0.5 * opt.epoch_size), int(0.75 * opt.epoch_size)],
-                                               gamma=0.1)
+    scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=[int(0.5 * opt.epoch_size), int(0.75 * opt.epoch_size)],
+        gamma=0.1
+    )
 
     total_start = time.time()
+
     for epoch in range(opt.epoch_size):
-        t_loss = run_epoch(model, train_loader, criterion, optimizer)
-        v_loss = run_epoch(model, valid_loader, criterion)
+        t_loss = run_epoch(model, train_loader, criterion, opt, optimizer)
+        v_loss = run_epoch(model, valid_loader, criterion, opt)
 
         train_loss.append(t_loss)
         valid_loss.append(v_loss)
         scheduler.step()
 
-        # 保存最优模型
         if v_loss < best_loss:
             best_loss = v_loss
             early_stop = 0
@@ -142,15 +144,18 @@ def train_model(model, train_loader, valid_loader, criterion, opt):
                 print(f"早停：{patience}轮无提升")
                 break
 
-        # 日志
         if epoch % 10 == 0:
             print(
-                f'Epoch {epoch + 1}/{opt.epoch_size} | Train: {t_loss:.6f} | Valid: {v_loss:.6f} | Best: {best_loss:.6f}')
-        log(f'{opt.model_filename}.log', f'Epoch {epoch + 1} | Train: {t_loss:.6f} | Valid: {v_loss:.6f}')
+                f'Epoch {epoch + 1}/{opt.epoch_size} | '
+                f'Train: {t_loss:.6f} | Valid: {v_loss:.6f} | Best: {best_loss:.6f}'
+            )
 
-    # 训练时间统计
+        log(f'{opt.model_filename}.log',
+            f'Epoch {epoch + 1} | Train: {t_loss:.6f} | Valid: {v_loss:.6f}')
+
     total_time = time.time() - total_start
     print(f'总训练时间：{total_time // 3600:.0f}h {total_time % 3600 // 60:.0f}m')
+
     return train_loss, valid_loss
 
 
@@ -201,10 +206,9 @@ def train_valid_split(dataset, test_size=0.1):
 
 if __name__ == '__main__':
     opt = get_args()
-    # ===================== 请修改这里的路径 =====================
+
     DATA_PATH = "/root/autodl-fs/data_git_version.h5"
     FEATURE_PATH = "/root/autodl-fs/11.MVSTGN-main/MVSTGN-main/data/crawled_feature.csv"
-    # ===========================================================
 
     # 实验路径配置
     exp_flag = f"causal_{opt.use_causal_conv}_temp_{'trans' if opt.temporal_use_transformer else 'mamba'}_dense_{opt.use_dense_conv}_spat_{'trans' if opt.spatial_use_transformer else 'mamba'}_fusion_{opt.fusion_mode}"
@@ -270,7 +274,7 @@ if __name__ == '__main__':
     # 训练
     if opt.train:
         print("开始训练...")
-        train_loss, valid_loss = train_model(model, train_loader, valid_loader, criterion, opt)
+        train_loss, valid_loss = train_model(model, train_loader, valid_loader, criterion, opt, mmn)
 
         # 保存损失曲线
         plt.figure(figsize=(10, 6))
